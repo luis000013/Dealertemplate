@@ -9,7 +9,7 @@
   /* =====================================================================
      CONFIGURACION (servidor maestro)
      ===================================================================== */
-  const API_URL = 'https://dealertemplate.vercel.app';
+  const API_URL = 'https://dealerpanel.vercel.app';   // dominio del PANEL (backend). No es el de esta pagina web.
   const DEALER_CODE = 'MASTER';
   /* Rutas publicas del panel. Todas reciben ?dealer=DEALER_CODE.
        perfil      -> GET {API_URL}/api/public/settings?dealer=MASTER
@@ -1285,6 +1285,10 @@ async function loadInventory() {
   if (t || d) observe();
   if (rv.status !== 'fulfilled') {
     warn('No se pudo cargar el inventario: ', rv);
+    const msg = String((rv.reason && rv.reason.message) || rv.reason);                                  /* pistas para quien configura (solo consola) */
+    if (API_URL.replace(/\/+$/, '') === location.origin) console.warn('API_URL apunta a ESTA MISMA pagina web; debe ser el dominio del panel (backend).');
+    else if (/HTTP 404/.test(msg)) console.warn('La ruta no existe en ' + API_URL + ': revisa API_ROUTES y el dominio del panel.');
+    else if (/failed to fetch|networkerror|load failed/i.test(msg)) console.warn('Posible bloqueo CORS: el panel debe permitir peticiones desde ' + location.origin);
     if (/^https?:\/\/(www\.)?vercel\.app\/?$/i.test(API_URL)) console.warn('API_URL apunta al dominio generico de Vercel: falta el subdominio de tu proyecto.');
     renderAll(); buildHero(); $('#grid').innerHTML = ''; $('#empty').hidden = true; $('#count').textContent = ''; showError('fail');
     return;
