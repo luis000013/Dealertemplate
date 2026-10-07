@@ -370,45 +370,112 @@ const TR = {
   fuel: { gasoline: 'Gasolina', gas: 'Gasolina', petrol: 'Gasolina', diesel: 'Diésel', hybrid: 'Híbrido', 'plug-in hybrid': 'Híbrido enchufable', electric: 'Eléctrico' },
   trans: { automatic: 'Automática', manual: 'Manual', cvt: 'CVT', 'semi-automatic': 'Semiautomática' },
   body: { suv: 'Jeepeta', sedan: 'Sedán', pickup: 'Camioneta', 'pick-up': 'Camioneta', 'pickup truck': 'Camioneta', truck: 'Camioneta', hatchback: 'Hatchback', coupe: 'Coupé', convertible: 'Convertible', van: 'Van', minivan: 'Minivan', wagon: 'Station wagon', crossover: 'Crossover' },
+  cond: { new: 'Nuevo', used: 'Usado', certified: 'Certificado', 'pre-owned': 'Usado' },
+  drive: { fwd: 'Delantera (FWD)', rwd: 'Trasera (RWD)', awd: 'AWD', '4wd': '4x4', '4x4': '4x4' },
 };
 const tr = (map, v) => { const x = String(v ?? '').trim(); return esc(map[x.toLowerCase()] || x); };
 
-/* Un registro del panel -> tarjeta. Columnas: auto.brand, auto.model, auto.year, auto.price, auto.currency, auto.down_payment,
-   auto.mileage, auto.fuel_type, auto.transmission, auto.body_type, auto.main_image_url, auto.salesperson_whatsapp */
-function toVehiculo(auto, i) {
-  if (!auto || typeof auto !== 'object') return null;
-  const foto = httpUrl(auto.main_image_url);
-  if (!foto) return null;                                                             /* sin foto: no se dibuja (evita tarjetas rotas) */
-  const marca = String(auto.brand ?? '').trim(), modelo = String(auto.model ?? '').trim(), precio = num(auto.price);
-  if (!marca || !modelo || !Number.isFinite(precio)) return null;                     /* registro incompleto: no se dibuja */
-  const año = num(auto.year), dp = num(auto.down_payment), km = num(auto.mileage);
-  const unidad = /mi/i.test(String(auto.mileage_unit ?? auto.distance_unit ?? '')) ? 'MI' : 'KM';
-  return {
-    id: esc(String(auto.id ?? `v${i}`)), marca: esc(marca), modelo: esc(modelo), precio,
-    currency: /usd/i.test(String(auto.currency ?? '')) ? 'USD' : 'DOP',               /* 'USD' -> $ ; 'RD$ (Pesos)' -> RD$ */
-    imagen: esc(foto), galeria: [{ src: esc(foto), label: 'Foto' }], wa: waDigits(auto.salesperson_whatsapp),
-    año: Number.isFinite(año) ? año : '',
-    inicial: dp > 0 ? dp : Math.round(precio * 0.30),                                 /* down_payment vacio o 0 -> 30% del precio */
-    uso: Number.isFinite(km) ? { n: km, u: unidad } : null, status: 'Disponible',
-    tipo: tr(TR.body, auto.body_type), transmision: tr(TR.trans, auto.transmission), combustible: tr(TR.fuel, auto.fuel_type),
-    motor: '', exterior: '', interior: '', traccion: '', pasajeros: '', recienImportado: false, cleanCarfax: false,
+/* ---------- Lectura flexible de lo que envia el panel ----------
+   - Acepta snake_case, camelCase y datos anidados (specs: { engine }, contact: { whatsapp }, ...).
+   - Cada dato se busca por varios nombres posibles; el primero que tenga valor se usa. */
+const snake = k => String(k).replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[\s\-]+/g, '_').toLowerCase();
+function flat(o, out = {}, depth = 0) {
+  if (!o || typeof o !== 'object' || depth > 3) return out;
+  const nested = [];
+  for (const [k, v] of Object.entries(o)) {                                  /* primero lo del nivel actual: gana sobre lo anidado */
+    const key = snake(k);
+    if (v && typeof v === 'object' && !Array.isArray(v)) nested.push(v);
+    else if (!(key in out) || out[key] === '' || out[key] === null || out[key] === undefined) out[key] = v;
+  }
+  nested.forEach(v => flat(v, out, depth + 1));
+  return out;
+}
+const P = (a, ...ks) => { for (const k of ks) { const v = a[k]; if (v !== undefined && v !== null && String(v).trim() !== '') return v; } return ''; };
+const pickFirst = (o, ...ks) => P(flat(o), ...ks);                /* para testimonios y entregas: tambien acepta camelCase y datos anidados */
+const isYes = v => v === true || v === 1 || /^(true|yes|si|sí|1|clean|limpio|disponible|available)$/i.test(String(v ?? '').trim());
+
+/* Fotos: la principal + todas las demas perspectivas, vengan como arreglo (images/photos/gallery...) o como campos sueltos (front_image_url, side_image_url...) */
+const IMG_KEY = /(image|img|photo|picture|foto|gallery|galeria)/;
+const VIEWS = [[/front|frontal|delant/, 'Frontal'], [/rear|back|trasera|posterior|atras/, 'Trasera'], [/side|lateral|perfil/, 'Lateral'], [/interior|cabin|dash|tablero|cabina|asiento|seat/, 'Interior'], [/engine|motor/, 'Motor'], [/trunk|cargo|maletero|baul|cajuela/, 'Maletero']];
+const viewLabel = hint => { const t = String(hint || '').toLowerCase(); for (const [rx, l] of VIEWS) if (rx.test(t)) return l; return ''; };
+function collectPhotos(a) {
+  const map = new Map();
+  const add = (u, hint, ord) => {
+    const src = httpUrl(u); if (!src) return;
+    const e = map.get(src);
+    if (e) { if (!viewLabel(e.hint) && viewLabel(hint)) e.hint = hint; return; }                       /* misma foto repetida: se conserva la mejor etiqueta */
+    map.set(src, { src, hint: String(hint || ''), ord: Number.isFinite(ord) ? ord : null, n: map.size });
   };
+  const walk = (v, key) => {
+    if (typeof v === 'string') return add(v, key);
+    if (Array.isArray(v)) return v.forEach(it => walk(it, key));
+    if (v && typeof v === 'object') {
+      const o = flat(v), url = P(o, 'url', 'src', 'image_url', 'photo_url', 'secure_url', 'blob_url', 'download_url', 'href');
+      if (url) add(url, `${key} ${P(o, 'label', 'view', 'perspective', 'angle', 'type', 'name', 'caption', 'category', 'title')}`, num(P(o, 'order', 'sort_order', 'position', 'index')));
+      else Object.entries(o).forEach(([k2, v2]) => walk(v2, k2));
+    }
+  };
+  add(P(a, 'main_image_url', 'main_image', 'cover_image_url', 'image_url'), 'main');
+  Object.keys(a).filter(k => IMG_KEY.test(k) && !/logo|avatar|icon/.test(k) && !['main_image_url', 'main_image', 'cover_image_url', 'image_url'].includes(k)).forEach(k => walk(a[k], k));
+  const list = [...map.values()]; const main = list.shift();
+  list.sort((x, y) => (x.ord ?? 1e6 + x.n) - (y.ord ?? 1e6 + y.n));
+  const used = new Set();
+  return [main, ...list].slice(0, 12).map((p, i) => {
+    let lab = viewLabel(p.hint) || (i === 0 ? 'Principal' : `Foto ${i + 1}`); if (used.has(lab)) lab = `${lab} ${i + 1}`; used.add(lab);
+    return { src: esc(p.src), label: esc(lab) };
+  });
 }
 
-/* Perfil del dealer (settings). Campos snake_case; los que no vengan conservan el valor original. */
-const pickFirst = (o, ...ks) => { for (const k of ks) { const v = o && o[k]; if (v !== undefined && v !== null && String(v).trim() !== '') return v; } return ''; };
-function normalizeSettings(raw) {
-  let o = Array.isArray(raw) ? raw[0] : raw;
-  if (o && typeof o === 'object' && !Array.isArray(o)) { const inner = o.settings || o.data || o.profile || o.dealer; if (inner && typeof inner === 'object') o = Array.isArray(inner) ? inner[0] : inner; }
-  if (!o || typeof o !== 'object') return null;
-  const t = (...ks) => String(pickFirst(o, ...ks)).trim();
+const DISCARDS = { sin_foto: 0, incompleto: 0 };
+/* Un registro del panel -> tarjeta y ficha tecnica */
+function toVehiculo(raw, i) {
+  if (!raw || typeof raw !== 'object') return null;
+  const a = flat(raw);
+  if (!httpUrl(P(a, 'main_image_url', 'main_image', 'cover_image_url', 'image_url'))) { DISCARDS.sin_foto++; return null; }   /* sin foto principal: no se dibuja */
+  const marca = String(P(a, 'brand', 'make', 'marca')).trim(), modelo = String(P(a, 'model', 'modelo')).trim(), precio = num(P(a, 'price', 'sale_price', 'precio'));
+  if (!marca || !modelo || !Number.isFinite(precio)) { DISCARDS.incompleto++; return null; }
+  const año = num(P(a, 'year', 'model_year', 'anio', 'ano')), dp = num(P(a, 'down_payment', 'initial_payment', 'inicial', 'enganche')), km = num(P(a, 'mileage', 'odometer', 'kilometraje', 'km', 'millas'));
+  const unidad = /mi|milla/i.test(String(P(a, 'mileage_unit', 'distance_unit', 'odometer_unit')) || (P(a, 'millas') ? 'mi' : '')) ? 'MI' : 'KM';
+  const galeria = collectPhotos(a), t = (...ks) => esc(String(P(a, ...ks)).trim());
+  const carfax = P(a, 'clean_carfax', 'carfax_clean', 'carfax', 'carfax_status', 'has_carfax');
   return {
-    nombre: t('dealer_name', 'business_name', 'company_name', 'name'), wa: waDigits(t('whatsapp', 'whatsapp_number', 'whatsapp_phone', 'phone_whatsapp', 'whatsapp_url')),
-    instagram: social(t('instagram_url', 'instagram'), 'instagram.com'), facebook: social(t('facebook_url', 'facebook'), 'facebook.com'),
-    telefono: t('phone', 'phone_number', 'contact_phone'), email: t('email', 'contact_email'), direccion: t('address', 'location'),
-    horario: t('business_hours', 'hours', 'schedule'), mapa: httpUrl(t('map_url', 'maps_url', 'google_maps_url')), privacidad: httpUrl(t('privacy_url')), terminos: httpUrl(t('terms_url')),
-    testimonials: Array.isArray(o.testimonials) ? o.testimonials : Array.isArray(o.reviews) ? o.reviews : null,
-    deliveries: Array.isArray(o.deliveries) ? o.deliveries : Array.isArray(o.happy_clients) ? o.happy_clients : Array.isArray(o.delivery_photos) ? o.delivery_photos : null,
+    id: esc(String(P(a, 'id', 'uuid', 'slug') || `v${i}`)), marca: esc(marca), modelo: esc(modelo), precio,
+    currency: /usd/i.test(String(P(a, 'currency', 'moneda', 'price_currency'))) ? 'USD' : 'DOP',    /* 'USD' -> $ ; 'RD$ (Pesos)' -> RD$ */
+    imagen: galeria[0].src, galeria, wa: waDigits(P(a, 'salesperson_whatsapp', 'salesperson_phone', 'seller_whatsapp', 'whatsapp')),
+    año: Number.isFinite(año) ? año : '', inicial: dp > 0 ? dp : Math.round(precio * 0.30),         /* down_payment vacio o 0 -> 30% del precio */
+    uso: Number.isFinite(km) ? { n: km, u: unidad } : null, status: /vend|sold/i.test(String(P(a, 'status', 'estado'))) ? 'Vendido' : 'Disponible',
+    tipo: tr(TR.body, P(a, 'body_type', 'body_style', 'type', 'tipo', 'category', 'carroceria')), transmision: tr(TR.trans, P(a, 'transmission', 'transmision', 'gearbox')),
+    combustible: tr(TR.fuel, P(a, 'fuel_type', 'fuel', 'combustible')), motor: t('engine', 'motor', 'engine_size', 'engine_type'),
+    exterior: t('exterior_color', 'color_exterior', 'color', 'paint'), interior: t('interior_color', 'color_interior', 'upholstery'),
+    traccion: tr(TR.drive, P(a, 'drivetrain', 'drive_type', 'traction', 'traccion', 'drive')), pasajeros: t('passengers', 'seats', 'seating_capacity', 'pasajeros', 'capacity'),
+    version: t('trim', 'version', 'edition'), puertas: t('doors', 'puertas'), condicion: tr(TR.cond, P(a, 'condition', 'condicion')), descripcion: t('description', 'descripcion', 'notes'),
+    recienImportado: isYes(P(a, 'recently_imported', 'just_imported', 'recien_importado', 'new_arrival')),
+    cleanCarfax: isYes(carfax) || /clean|limpio/i.test(String(carfax)),
+  };
+}
+const KNOWN_V = new Set(['id', 'uuid', 'slug', 'brand', 'make', 'marca', 'model', 'modelo', 'price', 'sale_price', 'precio', 'year', 'model_year', 'anio', 'ano', 'down_payment', 'initial_payment', 'inicial', 'enganche', 'mileage', 'odometer', 'kilometraje', 'km', 'millas', 'mileage_unit', 'distance_unit', 'odometer_unit', 'currency', 'moneda', 'price_currency', 'salesperson_whatsapp', 'salesperson_phone', 'seller_whatsapp', 'whatsapp', 'status', 'estado', 'body_type', 'body_style', 'type', 'tipo', 'category', 'carroceria', 'transmission', 'transmision', 'gearbox', 'fuel_type', 'fuel', 'combustible', 'engine', 'motor', 'engine_size', 'engine_type', 'exterior_color', 'color_exterior', 'color', 'paint', 'interior_color', 'color_interior', 'upholstery', 'drivetrain', 'drive_type', 'traction', 'traccion', 'drive', 'passengers', 'seats', 'seating_capacity', 'pasajeros', 'capacity', 'trim', 'version', 'edition', 'doors', 'puertas', 'condition', 'condicion', 'description', 'descripcion', 'notes', 'recently_imported', 'just_imported', 'recien_importado', 'new_arrival', 'clean_carfax', 'carfax_clean', 'carfax', 'carfax_status', 'has_carfax']);
+
+/* Perfil del dealer (settings): nombres snake_case o camelCase, planos o anidados (contact: {...}, social: {...}); tambien filas { key, value } */
+function normalizeSettings(raw) {
+  const kv = rows => (Array.isArray(rows) && rows.length && rows.every(r => r && typeof r === 'object' && ('value' in r) && ('key' in r || 'name' in r || 'setting' in r))) ? Object.fromEntries(rows.map(r => [r.key ?? r.name ?? r.setting, r.value])) : null;
+  let o = raw;
+  for (let n = 0; n < 3 && o; n++) {
+    if (Array.isArray(o)) { o = kv(o) || o[0]; continue; }
+    const w = ['settings', 'data', 'profile', 'dealer', 'result'].find(k => o && o[k] && typeof o[k] === 'object');
+    if (w && Object.keys(o).length <= 3) o = o[w]; else break;
+  }
+  if (!o || typeof o !== 'object') return null;
+  const a = flat(o), t = (...ks) => String(P(a, ...ks)).trim();
+  const arr = rx => { for (const [k, v] of Object.entries(a)) if (rx.test(k) && Array.isArray(v) && v.length) return v; return null; };
+  return {
+    nombre: t('dealer_name', 'business_name', 'company_name', 'trade_name', 'nombre', 'name'),
+    wa: waDigits(t('whatsapp', 'whatsapp_number', 'whatsapp_phone', 'whatsapp_url', 'whatsapp_link', 'phone_whatsapp', 'contact_whatsapp', 'sales_whatsapp', 'wa')),
+    instagram: social(t('instagram_url', 'instagram', 'instagram_link', 'instagram_handle', 'ig_url', 'ig'), 'instagram.com'),
+    facebook: social(t('facebook_url', 'facebook', 'facebook_link', 'fb_url', 'fb'), 'facebook.com'),
+    telefono: t('phone', 'phone_number', 'telephone', 'contact_phone', 'telefono', 'tel'), email: t('email', 'contact_email', 'correo'),
+    direccion: t('address', 'full_address', 'street_address', 'location', 'direccion'), horario: t('business_hours', 'opening_hours', 'hours', 'schedule', 'horario'),
+    mapa: httpUrl(t('map_url', 'maps_url', 'google_maps_url', 'google_map_url', 'location_url')), privacidad: httpUrl(t('privacy_url', 'privacy_policy_url')), terminos: httpUrl(t('terms_url', 'terms_of_service_url')),
+    testimonials: arr(/testimonial|review|opinion|resena|reseña/), deliveries: arr(/deliver|entrega|happy|cliente|showroom|gallery|galeria/), _flat: a,
   };
 }
 function applyProfile(p) {
@@ -421,12 +488,25 @@ function applyProfile(p) {
 /* Peticiones: la URL va como TEXTO (nunca un objeto URL) y sin opciones, para que funcione tambien en visores que reenvian
    fetch con postMessage. El tiempo limite se hace con Promise.race, sin AbortController. Sin cache. */
 const apiUrl = (route, extra = '') => `${API_URL}${route}?dealer=${encodeURIComponent(DEALER_CODE)}${extra}`;
+const DEBUG_ON = /[?&]debug=1\b/.test(location.search) || location.hash === '#debug';
+const DBG = { req: [] };
 async function getJson(url) {
-  const res = await Promise.race([fetch(url), new Promise((_, rej) => setTimeout(() => rej(new Error('tiempo agotado')), 12000))]);
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
+  const t0 = Date.now(); let status = 'sin respuesta';
+  try {
+    const res = await Promise.race([fetch(url), new Promise((_, rej) => setTimeout(() => rej(new Error('tiempo agotado')), 12000))]);
+    status = res.status;
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const json = await res.json();
+    if (DEBUG_ON) DBG.req.push({ url, status, ms: Date.now() - t0, json });
+    return json;
+  } catch (err) { if (DEBUG_ON) DBG.req.push({ url, status, error: String((err && err.message) || err) }); throw err; }
 }
-const listOf = json => (Array.isArray(json) ? json : (json && (json.vehicles || json.data || json.items || json.results)) || []);
+const listOf = (json, d = 0) => {
+  if (Array.isArray(json)) return json;
+  if (!json || typeof json !== 'object' || d > 2) return [];
+  for (const k of ['vehicles', 'vehiculos', 'items', 'results', 'rows', 'records', 'inventory', 'data']) { const v = json[k]; if (Array.isArray(v)) return v; if (v && typeof v === 'object') { const r = listOf(v, d + 1); if (r.length) return r; } }
+  return [];
+};
 const fetchVehiculos = async () => listOf(await getJson(apiUrl(API_ROUTES.vehicles, '&visibility=Disponible')));
 const fetchSettings = () => getJson(apiUrl(API_ROUTES.settings));
 
@@ -617,8 +697,8 @@ const cluster = (title, rows) => `
 function renderSheet() {
   const v = cur, imgs = vistas(v);
   /* Ficha plana y compacta: sin encabezados de grupo y sin "Importacion" */
-  const specs = [['Motor', v.motor], ['Transmisión', v.transmision], ['Combustible', v.combustible], ['Tracción', v.traccion], ['Tipo', v.tipo],
-                 ['Pasajeros', v.pasajeros], ['Exterior', v.exterior], ['Interior', v.interior], ['Uso', usoFmt(v)], ['Carfax', v.cleanCarfax ? 'Limpio' : '']].filter(([, val]) => val);
+  const specs = [['Versión', v.version], ['Motor', v.motor], ['Transmisión', v.transmision], ['Combustible', v.combustible], ['Tracción', v.traccion], ['Tipo', v.tipo], ['Puertas', v.puertas],
+                 ['Pasajeros', v.pasajeros], ['Condición', v.condicion], ['Exterior', v.exterior], ['Interior', v.interior], ['Uso', usoFmt(v)], ['Carfax', v.cleanCarfax ? 'Limpio' : '']].filter(([, val]) => val);
   const arrowBtn = (d, side, icon, label) => `<button data-g="${d}" class="absolute ${side} top-1/2 grid size-11 -translate-y-1/2 place-items-center rounded-full bg-bg/85 text-ink ring-1 ring-line backdrop-blur-md transition-transform duration-150 active:scale-95" aria-label="${label}">${I(icon)}</button>`;
   $('#sheetBody').innerHTML = `
   <div class="grid gap-3 p-3 pb-[calc(0.5rem+env(safe-area-inset-bottom,0px))] sm:gap-6 sm:p-5 lg:grid-cols-12 lg:gap-8 lg:p-7">
@@ -657,6 +737,7 @@ function renderSheet() {
       <dl class="mt-4 grid grid-cols-2 gap-x-5 gap-y-2.5 border-t border-line pt-3 sm:mt-5 sm:gap-y-3 sm:pt-4">
         ${specs.map(([k, val]) => `<div class="min-w-0"><dt class="text-xs text-mute">${k}</dt><dd class="mt-0.5 text-[13px] font-medium leading-snug tnum">${val}</dd></div>`).join('')}
       </dl>
+      ${v.descripcion ? `<p class="mt-4 text-sm leading-relaxed text-mute">${v.descripcion}</p>` : ''}
     </div>
   </div>`;
 }
@@ -1260,6 +1341,7 @@ function renderDeliveries(list) {
 }
 
 function applyData(arr) {
+  DISCARDS.sin_foto = 0; DISCARDS.incompleto = 0;
   VEHICULOS = arr.map(toVehiculo).filter(Boolean);
   if (!FROM_API.wa) { const a = arr.find(x => x && waDigits(x.salesperson_whatsapp)); if (a) DEALER.wa = waDigits(a.salesperson_whatsapp); }   /* sin WhatsApp global: el del primer vendedor */
   MARCAS = uniq(VEHICULOS.map(v => v.marca)).sort((a, b) => unesc(a).localeCompare(unesc(b), 'es'));
@@ -1281,7 +1363,9 @@ async function loadInventory() {
   applyProfile(settings); applyBrand(); applyContacts();
   const tList = (rt.status === 'fulfilled' && rt.value) ? listOf(rt.value) : settings && settings.testimonials;
   const dList = (rd.status === 'fulfilled' && rd.value) ? listOf(rd.value) : settings && settings.deliveries;
-  const t = renderTestimonials(tList), d = renderDeliveries(dList);
+  let t = false, d = false;
+  try { t = renderTestimonials(tList); } catch (e) { console.warn('Testimonios: ' + e.message); }      /* un fallo aqui nunca debe frenar el inventario */
+  try { d = renderDeliveries(dList); } catch (e) { console.warn('Entregas: ' + e.message); }
   if (t || d) observe();
   if (rv.status !== 'fulfilled') {
     warn('No se pudo cargar el inventario: ', rv);
@@ -1295,6 +1379,37 @@ async function loadInventory() {
   }
   try { applyData(rv.value ? listOf(rv.value) : []); }
   catch (err) { console.warn('No se pudo dibujar el inventario: ' + String((err && err.message) || err)); showError('fail'); }
+  if (DEBUG_ON) showDebug(settings, rv);
+}
+
+/* ---------- Diagnostico: abre la web con ?debug=1 y copia el reporte ---------- */
+const cut70 = v => { const x = typeof v === 'object' ? JSON.stringify(v) : String(v); return x.length > 70 ? x.slice(0, 70) + '…' : x; };
+async function showDebug(settings, rv) {
+  const L = [];
+  L.push('DIAGNOSTICO · ' + location.origin, `API_URL = ${API_URL} · DEALER_CODE = ${DEALER_CODE}`, '');
+  L.push('PETICIONES:'); DBG.req.forEach(r => L.push(` • ${r.url}\n   → ${r.error ? 'ERROR ' + r.error + ' (estado ' + r.status + ')' : 'OK ' + r.status + ' · ' + r.ms + ' ms · ' + (Array.isArray(r.json) ? 'arreglo de ' + r.json.length : 'objeto con: ' + Object.keys(r.json || {}).join(', '))}`));
+  const rq = DBG.req.find(r => r.url.includes(API_ROUTES.settings) && !r.error);
+  L.push('', 'PERFIL RECIBIDO (campos aplanados):');
+  if (rq && settings) Object.entries(settings._flat).forEach(([k, v]) => L.push(` ${k} = ${cut70(v)}`)); else L.push(' (no llegó: se usa el perfil original)');
+  L.push('', 'PERFIL APLICADO:', ` nombre=${DEALER.nombre} · whatsapp=${DEALER.wa} · instagram=${DEALER.instagram} · facebook=${DEALER.facebook}`, ` telefono=${DEALER.telefono} · direccion=${DEALER.direccion} · horario=${DEALER.horario}`,
+    ` testimonios del perfil=${settings && settings.testimonials ? settings.testimonials.length : 0} · entregas del perfil=${settings && settings.deliveries ? settings.deliveries.length : 0}`);
+  const rv0 = DBG.req.find(r => r.url.includes(API_ROUTES.vehicles) && !r.error), lista = rv0 ? listOf(rv0.json) : [];
+  L.push('', `VEHICULOS: recibidos ${lista.length} → dibujados ${VEHICULOS.length} (descartados: sin foto principal ${DISCARDS.sin_foto}, incompletos ${DISCARDS.incompleto})`);
+  if (lista[0]) {
+    const f = flat(lista[0]); L.push('Primer vehículo, campos recibidos:'); Object.entries(f).forEach(([k, v]) => L.push(` ${k} = ${cut70(v)}`));
+    L.push('Campos que la web todavía NO usa: ' + (Object.keys(f).filter(k => !KNOWN_V.has(k) && !IMG_KEY.test(k)).join(', ') || '(ninguno)'));
+    const v0 = VEHICULOS[0]; if (v0) L.push(`Fotos detectadas del primer dibujado: ${v0.galeria.length} → ${v0.galeria.map(g => g.label).join(', ')}`);
+  }
+  const probes = ['/api/public/testimonials', '/api/public/deliveries', '/api/public/happy-clients', '/api/public/reviews', '/api/public/gallery', '/api/public/dealer', '/api/public/profile', '/api/public/config'];
+  L.push('', 'RUTAS PROBADAS:');
+  await Promise.all(probes.map(async p => { try { const j = await getJson(apiUrl(p)); L.push(` ✓ ${p} → ${Array.isArray(j) ? 'arreglo de ' + j.length : 'objeto con: ' + Object.keys(j || {}).join(', ')}`); } catch (e) { L.push(` ✗ ${p} → ${String(e.message)}`); } }));
+  const txt = L.join('\n'), box = document.createElement('div');
+  box.id = 'dbg'; box.style.cssText = 'position:fixed;left:8px;right:8px;bottom:8px;max-height:62vh;overflow:auto;z-index:99999;background:#0b0d0f;color:#d6e2ee;font:12px/1.5 ui-monospace,Menlo,monospace;padding:12px;border-radius:14px;box-shadow:0 10px 40px rgb(0 0 0/.5)';
+  const bar = document.createElement('div'); bar.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;position:sticky;top:0';
+  const btn = (t, f) => { const b = document.createElement('button'); b.textContent = t; b.style.cssText = 'padding:8px 14px;border-radius:999px;border:0;background:#2457d6;color:#fff;font:600 13px system-ui;cursor:pointer'; b.onclick = f; return b; };
+  const pre = document.createElement('pre'); pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-word'; pre.textContent = txt;
+  bar.append(btn('Copiar reporte', () => { navigator.clipboard ? navigator.clipboard.writeText(txt).catch(() => {}) : 0; const r = document.createRange(); r.selectNodeContents(pre); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }), btn('Cerrar', () => box.remove()));
+  box.append(bar, pre); document.body.append(box); console.log(txt);
 }
 $('#retry').addEventListener('click', () => loadInventory());
 
